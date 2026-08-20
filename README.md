@@ -234,7 +234,6 @@ Visit `https://otaku-streamers-api.premmiz-real.workers.dev/` in your browser to
 
 ### Local Execution:
 ```bash
-cd "D:\Otaku-streamers api"
 npm start
 ```
 Server runs locally on **`http://localhost:8800`**.
