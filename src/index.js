@@ -1,6 +1,5 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
-import { serve } from '@hono/node-server'
 
 const app = new Hono()
 app.use('*', cors())
@@ -578,9 +577,5 @@ app.get('/', (c) => {
 </body>
 </html>`)
 })
-
-const port = 8800
-console.log(`[Server] Otaku-Streamers API running on http://localhost:${port}`)
-serve({ fetch: app.fetch, port })
 
 export default app
