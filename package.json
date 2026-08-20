@@ -1,0 +1,15 @@
+{
+  "name": "otaku-streamers-api",
+  "version": "1.0.0",
+  "description": "Otaku-Streamers Anime & Stream API with Auto-Session Management",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.10.0",
+    "hono": "^4.0.0"
+  }
+}
