@@ -5,27 +5,56 @@ const app = new Hono()
 app.use('*', cors())
 
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-const OTAKU_USERNAME = 'premmiz.real@gmail.com'
-const OTAKU_PASSWORD = 'realneko'
-
-let sessionCookies = ''
-let lastLoginTime = 0
 const SESSION_TTL = 30 * 60 * 1000 // 30 minutes
 
-// In-memory cache for anime watch URLs & episode mappings
-const animeCache = new Map()
+// Map of user session cookies: username -> { cookies, timestamp }
+const userSessions = new Map()
 
-// Authenticate session with otaku-streamers.com
-async function ensureSession() {
-  const now = Date.now()
-  if (sessionCookies && (now - lastLoginTime < SESSION_TTL)) {
-    return sessionCookies
+// Retrieve credentials or custom cookie from Request or Environment Variables
+function getAuthContext(c) {
+  const customCookie = c.req.header('x-otaku-cookie')
+  if (customCookie) {
+    return { type: 'cookie', cookie: customCookie }
   }
 
-  console.log('[Auth] Authenticating session on otaku-streamers.com...')
+  const reqUsername = c.req.header('x-otaku-username')
+  const reqPassword = c.req.header('x-otaku-password')
+
+  const username = reqUsername || c.env?.OTAKU_USERNAME || (typeof process !== 'undefined' ? process.env?.OTAKU_USERNAME : '')
+  const password = reqPassword || c.env?.OTAKU_PASSWORD || (typeof process !== 'undefined' ? process.env?.OTAKU_PASSWORD : '')
+
+  return { type: 'credentials', username, password }
+}
+
+// Authenticate session with otaku-streamers.com
+async function ensureSession(c) {
+  const authCtx = getAuthContext(c)
+
+  if (authCtx.type === 'cookie' && authCtx.cookie) {
+    return authCtx.cookie
+  }
+
+  const { username, password } = authCtx
+
+  if (!username || !password) {
+    throw {
+      status: 401,
+      error: 'Authentication Required',
+      message: 'No credentials provided. Please set OTAKU_USERNAME & OTAKU_PASSWORD environment variables or supply x-otaku-username and x-otaku-password headers.'
+    }
+  }
+
+  const now = Date.now()
+  const cached = userSessions.get(username)
+
+  if (cached && (now - cached.timestamp < SESSION_TTL)) {
+    return cached.cookies
+  }
+
+  console.log(`[Auth] Authenticating user '${username}' on otaku-streamers.com...`)
   const bodyData = new URLSearchParams({
-    username: OTAKU_USERNAME,
-    password: OTAKU_PASSWORD,
+    username,
+    password,
     remember: '1',
     redirect: '/'
   })
@@ -46,9 +75,9 @@ async function ensureSession() {
   const cookiePairs = []
   
   if (Array.isArray(rawHeader)) {
-    for (const c of rawHeader) {
-      if (c) {
-        const pair = c.split(';')[0]
+    for (const cItem of rawHeader) {
+      if (cItem) {
+        const pair = cItem.split(';')[0]
         if (pair) cookiePairs.push(pair)
       }
     }
@@ -57,15 +86,15 @@ async function ensureSession() {
     if (pair) cookiePairs.push(pair)
   }
 
-  sessionCookies = cookiePairs.join('; ')
-  lastLoginTime = now
-  console.log('[Auth] Session authenticated successfully!')
-  return sessionCookies
+  const cookies = cookiePairs.join('; ')
+  userSessions.set(username, { cookies, timestamp: now })
+  console.log(`[Auth] User '${username}' authenticated successfully!`)
+  return cookies
 }
 
 // Dynamically resolve exact anime title name from numeric OSID using op=fl
-async function resolveTitleByOsid(osid) {
-  const cookies = await ensureSession()
+async function resolveTitleByOsid(c, osid) {
+  const cookies = await ensureSession(c)
   const bodyData = new URLSearchParams({ op: 'fl', osid: String(osid) })
 
   const res = await fetch('https://otaku-streamers.com/a.php', {
@@ -88,12 +117,12 @@ async function resolveTitleByOsid(osid) {
 }
 
 // 1. Search Titles API
-async function searchTitles(query) {
+async function searchTitles(c, query) {
   if (!query) {
     throw { status: 400, error: 'Missing Query', message: 'Please specify search query using ?q=...' }
   }
 
-  const cookies = await ensureSession()
+  const cookies = await ensureSession(c)
   const bodyData = new URLSearchParams({ op: 'title_search', q: query })
 
   const res = await fetch('https://otaku-streamers.com/a.php', {
@@ -135,7 +164,7 @@ async function searchTitles(query) {
 }
 
 // 2. Extract Page & Parse Episode Links
-async function parseWatchPage(urlInput) {
+async function parseWatchPage(c, urlInput) {
   let fullUrl = urlInput.trim()
   if (!fullUrl.startsWith('http://') && !fullUrl.startsWith('https://')) {
     fullUrl = 'https://otaku-streamers.com' + (fullUrl.startsWith('/') ? '' : '/') + fullUrl
@@ -146,7 +175,7 @@ async function parseWatchPage(urlInput) {
     throw { status: 400, error: 'Invalid URL', message: 'The provided input is not a valid URL.' }
   }
 
-  const cookies = await ensureSession()
+  const cookies = await ensureSession(c)
   const res = await fetch(parsedUrl.href, {
     headers: {
       'User-Agent': DEFAULT_USER_AGENT,
@@ -209,57 +238,41 @@ async function parseWatchPage(urlInput) {
 }
 
 // 3. Resolve Stream by OSID or Title Query and Episode Number
-async function resolveStreamByOsidOrQuery(osid, query, targetEp = 1) {
+async function resolveStreamByOsidOrQuery(c, osid, query, targetEp = 1) {
   const epNum = parseInt(targetEp, 10) || 1
-  let cacheKey = osid ? `osid_${osid}` : `query_${query}`
+  let mainWatchUrl = null
 
-  // Check in-memory cache for episode URL mapping
-  let epMap = animeCache.get(cacheKey)
-
-  if (!epMap) {
-    let mainWatchUrl = null
-
-    if (osid) {
-      // Dynamically resolve title name for OSID
-      const titleName = await resolveTitleByOsid(osid)
-      if (titleName) {
-        const searchRes = await searchTitles(titleName)
-        if (searchRes.results && searchRes.results.length > 0) {
-          const exactMatch = searchRes.results.find(r => r.osid === parseInt(osid, 10))
-          mainWatchUrl = exactMatch ? exactMatch.watch_url : searchRes.results[0].watch_url
-        }
-      }
-    } else if (query) {
-      const searchRes = await searchTitles(query)
+  if (osid) {
+    const titleName = await resolveTitleByOsid(c, osid)
+    if (titleName) {
+      const searchRes = await searchTitles(c, titleName)
       if (searchRes.results && searchRes.results.length > 0) {
-        mainWatchUrl = searchRes.results[0].watch_url
+        const exactMatch = searchRes.results.find(r => r.osid === parseInt(osid, 10))
+        mainWatchUrl = exactMatch ? exactMatch.watch_url : searchRes.results[0].watch_url
       }
     }
-
-    if (!mainWatchUrl) {
-      throw { status: 404, error: 'Anime Not Found', message: `Could not find anime for OSID/query '${osid || query}'.` }
+  } else if (query) {
+    const searchRes = await searchTitles(c, query)
+    if (searchRes.results && searchRes.results.length > 0) {
+      mainWatchUrl = searchRes.results[0].watch_url
     }
-
-    // Fetch main watch page to get episode mapping
-    const basePage = await parseWatchPage(mainWatchUrl)
-    
-    epMap = {
-      title: basePage.title,
-      main_watch_url: mainWatchUrl,
-      episodes_map: new Map()
-    }
-
-    basePage.episodes.forEach(e => {
-      epMap.episodes_map.set(e.episode, e.watch_url)
-    })
-
-    animeCache.set(cacheKey, epMap)
   }
 
-  const targetWatchUrl = epMap.episodes_map.get(epNum) || epMap.main_watch_url
-  const targetPage = await parseWatchPage(targetWatchUrl)
+  if (!mainWatchUrl) {
+    throw { status: 404, error: 'Anime Not Found', message: `Could not find anime for OSID/query '${osid || query}'.` }
+  }
 
-  const formattedEpisodes = Array.from(epMap.episodes_map.entries()).map(([num, watchUrl]) => ({
+  const basePage = await parseWatchPage(c, mainWatchUrl)
+  const episodesMap = new Map()
+
+  basePage.episodes.forEach(e => {
+    episodesMap.set(e.episode, e.watch_url)
+  })
+
+  const targetWatchUrl = episodesMap.get(epNum) || mainWatchUrl
+  const targetPage = await parseWatchPage(c, targetWatchUrl)
+
+  const formattedEpisodes = Array.from(episodesMap.entries()).map(([num, watchUrl]) => ({
     episode: num,
     title: `Episode ${num}`,
     stream_url_api: osid ? `/api/stream?osid=${osid}&ep=${num}` : `/api/stream?q=${encodeURIComponent(query)}&ep=${num}`,
@@ -290,7 +303,7 @@ app.get('/api/stream', async (c) => {
 
   try {
     if (url) {
-      const pageData = await parseWatchPage(url)
+      const pageData = await parseWatchPage(c, url)
       return c.json({
         status: 'success',
         title: pageData.title,
@@ -300,7 +313,7 @@ app.get('/api/stream', async (c) => {
         episodes: pageData.episodes
       })
     } else if (osid || query) {
-      const data = await resolveStreamByOsidOrQuery(osid, query, ep)
+      const data = await resolveStreamByOsidOrQuery(c, osid, query, ep)
       return c.json(data)
     } else {
       throw {
@@ -318,7 +331,7 @@ app.get('/api/stream', async (c) => {
 app.get('/api/search', async (c) => {
   const query = c.req.query('q') || c.req.query('query')
   try {
-    const data = await searchTitles(query)
+    const data = await searchTitles(c, query)
     return c.json(data)
   } catch (err) {
     return c.json({ status: 'error', error: err.error || 'Search Error', message: err.message || 'Failed to search' }, err.status || 500)
@@ -334,7 +347,7 @@ app.get('/api/episodes', async (c) => {
     if (!osid && !query) {
       throw { status: 400, error: 'Missing Parameter', message: 'Please specify ?osid=1042 OR ?q=To%20Love-Ru' }
     }
-    const data = await resolveStreamByOsidOrQuery(osid, query, 1)
+    const data = await resolveStreamByOsidOrQuery(c, osid, query, 1)
     return c.json({
       status: 'success',
       title: data.title,
@@ -347,7 +360,16 @@ app.get('/api/episodes', async (c) => {
 })
 
 // Health Check
-app.get('/api/health', (c) => c.json({ status: 'ok', service: 'Otaku-Streamers API', account: OTAKU_USERNAME, timestamp: new Date().toISOString() }))
+app.get('/api/health', (c) => {
+  const authCtx = getAuthContext(c)
+  return c.json({
+    status: 'ok',
+    service: 'Otaku-Streamers API',
+    auth_mode: authCtx.type,
+    authenticated_user: authCtx.username || (authCtx.type === 'cookie' ? 'custom-session-cookie' : 'none'),
+    timestamp: new Date().toISOString()
+  })
+})
 
 // Complete Interactive Playground & Full API Documentation UI
 app.get('/', (c) => {
@@ -356,7 +378,7 @@ app.get('/', (c) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Otaku-Streamers API — Complete Documentation & Tester</title>
+  <title>Otaku-Streamers API — Environment & Custom Auth</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
@@ -403,7 +425,7 @@ app.get('/', (c) => {
     .form-group { margin-bottom: 16px; }
     .form-row { display: flex; gap: 12px; }
     label { display: block; font-size: 0.85rem; font-weight: 600; color: var(--text-muted); margin-bottom: 8px; }
-    input[type="text"], select {
+    input[type="text"], input[type="password"] {
       width: 100%;
       background: var(--code-bg);
       border: 1px solid var(--border);
@@ -414,7 +436,7 @@ app.get('/', (c) => {
       font-size: 0.9rem;
       outline: none;
     }
-    input[type="text"]:focus, select:focus { border-color: var(--accent); }
+    input[type="text"]:focus, input[type="password"]:focus { border-color: var(--accent); }
     .btn {
       background: linear-gradient(135deg, #e60000 0%, #b30000 100%);
       color: #ffffff;
@@ -459,9 +481,9 @@ app.get('/', (c) => {
 </head>
 <body>
   <div class="container">
-    <div class="badge">AUTO-AUTHENTICATED API SUITE</div>
-    <h1>Otaku-Streamers API Suite</h1>
-    <p class="subtitle">Direct MP4 Video Stream Extractor & Complete API Documentation.</p>
+    <div class="badge">SECURE ENVIRONMENT & USER AUTH API</div>
+    <h1>Otaku-Streamers API</h1>
+    <p class="subtitle">Direct MP4 Video Stream Extractor with Custom User Authentication & Env Secrets Support.</p>
 
     <!-- LIVE TESTER CARD -->
     <div class="card">
@@ -476,10 +498,20 @@ app.get('/', (c) => {
           <label>Episode Number (ep)</label>
           <input type="text" id="test-ep" value="1" placeholder="1">
         </div>
-        <div style="display: flex; align-items: flex-end;" class="form-group">
-          <button class="btn" onclick="testStreamApi()">Get MP4 Stream</button>
+      </div>
+
+      <div class="form-row" style="margin-bottom: 16px;">
+        <div style="flex: 1;" class="form-group">
+          <label>Custom Username Header (x-otaku-username, optional)</label>
+          <input type="text" id="custom-user" placeholder="Defaults to ENV">
+        </div>
+        <div style="flex: 1;" class="form-group">
+          <label>Custom Password Header (x-otaku-password, optional)</label>
+          <input type="password" id="custom-pass" placeholder="Defaults to ENV">
         </div>
       </div>
+
+      <button class="btn" onclick="testStreamApi()">Get MP4 Stream</button>
 
       <div class="result-box" id="result-box"></div>
       <video id="video-preview" controls class="video-preview"></video>
@@ -487,53 +519,38 @@ app.get('/', (c) => {
 
     <!-- DOCUMENTATION CARD -->
     <div class="card">
-      <h3 style="margin-bottom: 20px;">📖 Full API Documentation</h3>
+      <h3 style="margin-bottom: 20px;">🔐 Environment Variables & Request Headers</h3>
+      
+      <h4>Option A: Cloudflare Worker Environment Variables</h4>
+      <p style="color: var(--text-muted); font-size: 0.88rem; margin-bottom: 16px;">Set your account credentials securely in Cloudflare Workers using secrets:</p>
+      <pre style="background: var(--code-bg); padding: 12px; border-radius: 8px; font-family: 'JetBrains Mono'; font-size: 0.85rem; color: #ff4d4d;">npx wrangler secret put OTAKU_USERNAME
+npx wrangler secret put OTAKU_PASSWORD</pre>
 
+      <h4 style="margin-top: 24px;">Option B: Request Headers (Pass your own login)</h4>
+      <p style="color: var(--text-muted); font-size: 0.88rem; margin-bottom: 12px;">Users can supply their own login credentials in any HTTP request header:</p>
       <table>
         <thead>
           <tr>
-            <th>Endpoint</th>
-            <th>Parameters</th>
-            <th>Description & Example</th>
+            <th>Header Name</th>
+            <th>Type</th>
+            <th>Description</th>
           </tr>
         </thead>
         <tbody>
           <tr>
-            <td><code><span class="method">GET</span> /api/stream</code></td>
-            <td>
-              <code>?osid={osid}&ep={episode}</code><br>
-              OR <code>?q={query}&ep={episode}</code><br>
-              OR <code>?url={watch_url}</code>
-            </td>
-            <td>
-              <strong>Resolves the direct MP4 video streaming link for ANY episode!</strong><br>
-              Example: <code><a href="/api/stream?osid=1042&ep=1" target="_blank" style="color:#38bdf8;">/api/stream?osid=1042&ep=1</a></code><br>
-              Example: <code><a href="/api/stream?osid=1042&ep=2" target="_blank" style="color:#38bdf8;">/api/stream?osid=1042&ep=2</a></code>
-            </td>
+            <td><code>x-otaku-username</code></td>
+            <td>String</td>
+            <td>User's otaku-streamers.com email/username</td>
           </tr>
           <tr>
-            <td><code><span class="method">GET</span> /api/search</code></td>
-            <td><code>?q={query}</code></td>
-            <td>
-              Search anime titles to get OSID, cover poster, year, and watch URLs.<br>
-              Example: <code><a href="/api/search?q=To%20Love-Ru" target="_blank" style="color:#38bdf8;">/api/search?q=To Love-Ru</a></code>
-            </td>
+            <td><code>x-otaku-password</code></td>
+            <td>String</td>
+            <td>User's otaku-streamers.com password</td>
           </tr>
           <tr>
-            <td><code><span class="method">GET</span> /api/episodes</code></td>
-            <td><code>?osid={osid}</code> OR <code>?q={query}</code></td>
-            <td>
-              Get list of all episode numbers & direct stream APIs for an anime.<br>
-              Example: <code><a href="/api/episodes?osid=1042" target="_blank" style="color:#38bdf8;">/api/episodes?osid=1042</a></code>
-            </td>
-          </tr>
-          <tr>
-            <td><code><span class="method">GET</span> /api/health</code></td>
-            <td>None</td>
-            <td>
-              Check server status and account authentication session.<br>
-              Example: <code><a href="/api/health" target="_blank" style="color:#38bdf8;">/api/health</a></code>
-            </td>
+            <td><code>x-otaku-cookie</code></td>
+            <td>String</td>
+            <td>Direct session cookie string (bypasses login)</td>
           </tr>
         </tbody>
       </table>
@@ -544,12 +561,15 @@ app.get('/', (c) => {
     async function testStreamApi() {
       const q = document.getElementById('test-query').value.trim();
       const ep = document.getElementById('test-ep').value.trim() || '1';
+      const user = document.getElementById('custom-user').value.trim();
+      const pass = document.getElementById('custom-pass').value.trim();
+
       const resBox = document.getElementById('result-box');
       const vid = document.getElementById('video-preview');
 
       resBox.style.display = 'block';
       vid.style.display = 'none';
-      resBox.innerText = 'Resolving direct MP4 video stream for ' + q + ' Episode ' + ep + '...';
+      resBox.innerText = 'Resolving direct MP4 video stream...';
 
       try {
         let fetchUrl = '';
@@ -561,7 +581,11 @@ app.get('/', (c) => {
           fetchUrl = '/api/stream?q=' + encodeURIComponent(q) + '&ep=' + ep;
         }
 
-        const res = await fetch(fetchUrl);
+        const headers = {};
+        if (user) headers['x-otaku-username'] = user;
+        if (pass) headers['x-otaku-password'] = pass;
+
+        const res = await fetch(fetchUrl, { headers });
         const data = await res.json();
         resBox.innerText = JSON.stringify(data, null, 2);
 
