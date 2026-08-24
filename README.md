@@ -1,4 +1,4 @@
-# Otaku-Streamers API (`D:\Otaku-streamers api`)
+# Otaku-Streamers API
 
 ⚡ **Automated Session API** for searching anime titles, listing episode catalogs, extracting signed `/g/` watch URLs, and resolving **direct `.mp4` video streaming links** (`https://vid17.otaku-streamers.com/s/....mp4`) from `otaku-streamers.com`!
 
